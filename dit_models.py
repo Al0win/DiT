@@ -65,19 +65,13 @@ transform = transforms.Compose([
 
 class NoiseScheduler:
     """
-    Implements noise scheduling for the diffusion process.
-    Supports both linear and cosine schedules.
+    Implements a linear noise schedule for the diffusion process.
     """
-    def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02, schedule_type='linear'):
+    def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02):
         self.num_timesteps = num_timesteps
-        self.schedule_type = schedule_type
         
-        if schedule_type == 'linear':
-            self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
-        elif schedule_type == 'cosine':
-            self.betas = self._cosine_beta_schedule(num_timesteps)
-        else:
-            raise ValueError(f"Unknown schedule type: {schedule_type}")
+        # Only define the linear schedule
+        self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
         
         # Pre-compute useful quantities
         self.alphas = 1.0 - self.betas
@@ -115,15 +109,6 @@ class NoiseScheduler:
         self.posterior_mean_coef1 = self.posterior_mean_coef1.to(device)
         self.posterior_mean_coef2 = self.posterior_mean_coef2.to(device)
         return self
-        
-    def _cosine_beta_schedule(self, timesteps, s=0.008):
-        """Cosine schedule as proposed in https://arxiv.org/abs/2102.09672"""
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.9999)
     
     def add_noise(self, x_0, t, noise=None):
         """

@@ -156,7 +156,7 @@ def run_single_experiment(cfg, dataset_root, outdir, exp_id, config_dict):
     ).to(device)
 
     # Scheduler
-    noise_scheduler = NoiseScheduler(num_timesteps=config_dict["timesteps"], schedule_type='linear').to(device)
+    noise_scheduler = NoiseScheduler(num_timesteps=config_dict["timesteps"]).to(device)    # Dataloader
     # Dataloader
     dataloader = build_dataloader(dataset_root, batch_size=cfg["batch_size"], shuffle=True)
 
