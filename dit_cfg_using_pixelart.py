@@ -15,7 +15,7 @@ from diffusers import DiffusionPipeline, DDIMScheduler
 import torch
 from PIL import Image
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 import os
 
 # Set cache directory to /mnt/local/hf to avoid filling up /home/jovyan
@@ -38,147 +38,164 @@ DEFAULT_MODEL = "PixArt-alpha/PixArt-XL-2-512x512"
 
 @torch.no_grad()
 def visualize_diffusion_evolution_pretrained(
-    num_inference_steps=100,
-    prompt="a beautiful landscape with mountains and rivers",
-    seed=42,
-    device='cuda',
-    model_id="PixArt-alpha/PixArt-XL-2-512x512"
-):
+    num_inference_steps: int = 100,
+    prompt: str = "a beautiful landscape with mountains and rivers",
+    seed: int = 42,
+    device: str = "cuda",
+    model_id: str = "PixArt-alpha/PixArt-XL-2-512x512",
+    use_clamp: bool = False,
+    clamp_value: float = 5.0,
+    capture_every: int = None,             # if None, captures ~10 evenly spaced steps
+) -> Tuple[List[Image.Image], List[str], Dict[str, Any]]:
     """
-    Visualize the evolving prediction of clean images at various timesteps
-    during the reverse diffusion process using a pre-trained DiT-based model.
-    
-    This captures the x_0 prediction at EACH step during a SINGLE denoising run.
-    Uses PixArt-alpha which has a TRANSFORMER architecture (DiT), not UNet.
+    Load a pretrained DiT-based model and capture x_0 predictions at each denoising step.
+    Returns: (captured_images_list, timestep_labels, diagnostics)
+    diagnostics includes per-step mean absolute norms for latents and noise predictions.
     """
-    print(f"Loading pre-trained DiT-based model: {model_id}...")
-    
-    # Load DiT-based model
+
+    print(f"Loading model '{model_id}' (device={device})...")
     pipe = DiffusionPipeline.from_pretrained(
         model_id,
-        torch_dtype=torch.float16 if 'cuda' in device else torch.float32,
-        cache_dir=CACHE_DIR
+        torch_dtype=torch.float16 if "cuda" in device else torch.float32,
+        cache_dir=CACHE_DIR,
     )
-    
-    # IMPORTANT: Replace scheduler with DDIM for consistency
+    # Replace scheduler with DDIM for deterministic sampling if desired
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    print(f"  Using DDIM scheduler (replaced {type(pipe.scheduler).__name__})")
-    
     pipe = pipe.to(device)
-    
-    # Set seed
-    generator = torch.Generator(device=device).manual_seed(seed)
-    
-    # Get model components - NOTE: DiT uses 'transformer' not 'unet'
-    transformer = pipe.transformer  # DiT transformer instead of UNet
+
+    # Determine transformer dtype robustly
+    transformer = pipe.transformer
+    try:
+        transformer_dtype = next(transformer.parameters()).dtype
+    except StopIteration:
+        transformer_dtype = torch.float16 if "cuda" in device else torch.float32
+
     vae = pipe.vae
     scheduler = pipe.scheduler
-    text_encoder = pipe.text_encoder
     tokenizer = pipe.tokenizer
-    
-    # Encode prompt using T5 tokenizer
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=120,  # PixArt uses max_length=120
-        truncation=True,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids.to(device)
+    text_encoder = pipe.text_encoder
+
+    # Prepare text embeddings (T5 encoder typical)
+    text_inputs = tokenizer(prompt, padding="max_length", truncation=True, max_length=120, return_tensors="pt")
+    input_ids = text_inputs.input_ids.to(device)
     attention_mask = text_inputs.attention_mask.to(device)
-    
     with torch.no_grad():
-        # T5 encoder returns encoder outputs
-        prompt_embeds = text_encoder(text_input_ids, attention_mask=attention_mask)[0]
-        prompt_attention_mask = attention_mask
-    
-    # Set timesteps
+        prompt_embeds = text_encoder(input_ids, attention_mask=attention_mask)[0].to(device).to(transformer_dtype)
+    prompt_attention_mask = attention_mask.to(device)
+
+    # Timesteps
     scheduler.set_timesteps(num_inference_steps, device=device)
     timesteps = scheduler.timesteps
-    
-    # Create initial latent noise ONCE
-    # PixArt uses different latent dimensions than SD
+
+    # Latent shape (PixArt-specific heuristic)
     height = width = 512 if "512" in model_id else 1024
     latent_height = height // 8
     latent_width = width // 8
-    latent_channels = transformer.config.in_channels if hasattr(transformer.config, 'in_channels') else 4
-    
+    latent_channels = getattr(transformer.config, "in_channels", 4)
     latent_shape = (1, latent_channels, latent_height, latent_width)
-    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=prompt_embeds.dtype)
+
+    generator = torch.Generator(device=device).manual_seed(seed)
+    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=transformer_dtype)
     latents = latents * scheduler.init_noise_sigma
-    
-    print(f"\nGenerating single image evolution with {num_inference_steps} steps...")
-    print(f"  Latent shape: {latent_shape}")
-    print(f"  Using DiT transformer: {type(transformer).__name__}")
-    
-    # Storage for intermediate predictions
-    grid_images = []
-    all_predictions = []
-    timestep_labels = []
-    
-    # Single continuous denoising loop
-    from tqdm import tqdm
+
+    # diagnostics
+    diagnostics: Dict[str, List[Any]] = {
+        "timesteps": [],
+        "noise_mean_abs": [],  # mean abs of predicted noise (per-step)
+        "latents_mean_abs_before": [],  # mean abs of latents before step
+        "latents_mean_abs_after": [],   # mean abs of latents after step
+    }
+
+    grid_images: List[Image.Image] = []
+    captured_images: List[Image.Image] = []
+    timestep_labels: List[str] = []
+
+    # choose capture_every to get ~10 captures if not specified
+    if capture_every is None:
+        capture_every = max(1, len(timesteps) // 10)
+
+    print("Running denoising and capturing x_0 predictions...")
     for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
-        # Expand latents if needed
+        # scale latents for model input
         latent_model_input = scheduler.scale_model_input(latents, t)
-        
-        # Ensure timestep is properly formatted for transformer (needs to be a tensor for batch)
-        current_timestep = torch.tensor([t], device=device)
-        
-        # Predict noise using TRANSFORMER (not UNet)
-        # PixArt transformer expects: sample, timestep, encoder_hidden_states, encoder_attention_mask
+
+        # ensure timestep tensor with correct dtype and device for transformer
+        current_timestep = torch.full((latent_model_input.shape[0],), int(t), device=device, dtype=torch.long)
+
+        # Predict noise with transformer (encoder_hidden_states=prompt_embeds)
+        # Some transformers expect timestep shaped (batch,) or (batch,1) — this matches Diffusers practice
         noise_pred = transformer(
-            latent_model_input,
+            latent_model_input.to(transformer_dtype),
             timestep=current_timestep,
             encoder_hidden_states=prompt_embeds,
             encoder_attention_mask=prompt_attention_mask,
             return_dict=False
         )[0]
-        
-        # PixArt transformer outputs 8 channels: [noise (4), variance (4)]
-        # We only need the first 4 channels (the noise prediction)
+
+        # If transformer outputs extra channels (variance), keep only first 4
         if noise_pred.shape[1] == 8:
             noise_pred = noise_pred[:, :4, :, :]
-        
-        # Compute the previous noisy sample
+
+        # Diagnostics: record mean absolute values
+        diagnostics["timesteps"].append(int(t))
+        diagnostics["noise_mean_abs"].append(float(noise_pred.abs().mean().cpu().item()))
+        diagnostics["latents_mean_abs_before"].append(float(latents.abs().mean().cpu().item()))
+
+        # Optional clamp for numerical stability
+        if use_clamp:
+            noise_pred = noise_pred.clamp(-clamp_value, clamp_value)
+
+        # Use scheduler.step with return_dict=True for robust named fields
         scheduler_output = scheduler.step(noise_pred, t, latents, return_dict=True)
-        
-        # CAPTURE x_0 prediction BEFORE updating latents
-        if hasattr(scheduler_output, 'pred_original_sample') and scheduler_output.pred_original_sample is not None:
-            pred_original_sample = scheduler_output.pred_original_sample
+        # prev_sample is the updated latent for next iteration
+        prev_sample = getattr(scheduler_output, "prev_sample", None)
+        if prev_sample is None:
+            # fallback if scheduler returned tuple
+            prev_sample = scheduler_output[0] if isinstance(scheduler_output, (tuple, list)) else None
+
+        # Compute pred_original_sample if provided or compute fallback
+        pred_original_sample = getattr(scheduler_output, "pred_original_sample", None)
+        if pred_original_sample is None:
+            # fallback compute using alphas_cumprod (be careful with indexing types)
+            alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
+            if alphas_cumprod is None:
+                # if scheduler doesn't expose, skip capturing x_0
+                pred_original_sample = None
+            else:
+                # ensure alphas_cumprod is tensor on device
+                ac = torch.as_tensor(alphas_cumprod, device=device, dtype=transformer_dtype)
+                alpha_prod_t = ac[int(t)]
+                beta_prod_t = 1 - alpha_prod_t
+                pred_original_sample = (latents - beta_prod_t.sqrt() * noise_pred) / alpha_prod_t.sqrt()
+
+        # Decode and capture x_0 prediction if available
+        if pred_original_sample is not None:
+            with torch.no_grad():
+                scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
+                # decode expects dtype matching VAE weights; cast to vae dtype if necessary
+                vae_dtype = next(vae.parameters()).dtype
+                decoded = vae.decode((pred_original_sample / scaling_factor).to(vae_dtype), return_dict=False)[0]
+                img = (decoded / 2 + 0.5).clamp(0, 1)
+                img = img.cpu().permute(0, 2, 3, 1).float().numpy()
+                img = (img * 255).round().astype("uint8")
+                pil = Image.fromarray(img[0])
+                grid_images.append(pil)
+                if (i % capture_every == 0) or (i == len(timesteps) - 1):
+                    captured_images.append(pil)
+                    timestep_labels.append(f"t={int(t)}")
+
+        # update diagnostics after updating latents
+        if prev_sample is not None:
+            latents = prev_sample
+            diagnostics["latents_mean_abs_after"].append(float(latents.abs().mean().cpu().item()))
         else:
-            # Some schedulers don't return pred_original_sample, compute it manually
-            # For DDPM/DPMSolver: x_0 = (x_t - sqrt(1-alpha_t) * noise_pred) / sqrt(alpha_t)
-            alpha_prod_t = scheduler.alphas_cumprod[t]
-            beta_prod_t = 1 - alpha_prod_t
-            pred_original_sample = (latents - beta_prod_t ** 0.5 * noise_pred) / alpha_prod_t ** 0.5
-        
-        # Decode and save this x_0 prediction
-        with torch.no_grad():
-            # VAE expects latents to be scaled
-            scaling_factor = vae.config.scaling_factor if hasattr(vae.config, 'scaling_factor') else 0.18215
-            image = vae.decode(pred_original_sample / scaling_factor, return_dict=False)[0]
-        
-        # Convert to PIL
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-        image = (image * 255).round().astype("uint8")
-        image = Image.fromarray(image[0])
-        
-        # Save for 10x10 grid (all 100 steps)
-        grid_images.append(image)
-        
-        # Save for evolution visualization (10 key steps)
-        if i % max(1, len(timesteps) // 10) == 0 or i == len(timesteps) - 1:
-            all_predictions.append(image)
-            timestep_labels.append(f"t={t.item()}")
-        
-        # NOW update latents for next iteration
-        latents = scheduler_output.prev_sample
-    
-    print(f"\nCaptured {len(grid_images)} x_0 predictions from single denoising run")
-    
-    return all_predictions, timestep_labels, grid_images
+            # if we couldn't obtain prev_sample, break to avoid infinite loop
+            print("Warning: scheduler did not return prev_sample; breaking.")
+            break
+
+    print(f"Captured {len(captured_images)} x_0 predictions from denoising run.")
+    out_diagnostics = {"prompt": prompt, "model_id": model_id, "diagnostics": diagnostics}
+    return captured_images, timestep_labels, grid_images, out_diagnostics
 
 # %%
 import transformers
@@ -187,13 +204,15 @@ import matplotlib.pyplot as plt
 
 device = "cuda:1"
 
-predictions, labels, grid_images = visualize_diffusion_evolution_pretrained(
+predictions, labels, grid_images, a = visualize_diffusion_evolution_pretrained(
     num_inference_steps=100,
     prompt="a beautiful landscape with mountains, lakes and forests",
     seed=42,
     device=device,
     model_id=DEFAULT_MODEL
 )
+
+print(f"Diagnostic: {a}")
 
 # Visualize the evolution of predictions
 fig, axes = plt.subplots(2, 5, figsize=(20, 8))
@@ -289,325 +308,245 @@ def classifier_free_guidance(conditional_pred, unconditional_pred, guidance_scal
 
 @torch.no_grad()
 def generate_with_cfg(
-    prompt="a beautiful landscape",
-    num_inference_steps=50,
-    guidance_scale=7.5,
-    seed=42,
-    device='cuda',
-    model_id="PixArt-alpha/PixArt-XL-2-512x512"
-):
+    prompt: str = "a beautiful landscape",
+    num_inference_steps: int = 50,
+    guidance_scale: float = 7.5,
+    seed: int = 42,
+    device: str = "cuda",
+    model_id: str = "PixArt-alpha/PixArt-XL-2-512x512",
+    use_clamp: bool = True,
+    clamp_value: float = 5.0,
+) -> Tuple[Image.Image, Dict[str, Any]]:
     """
-    Generate an image with a MANUAL and CORRECT implementation of Classifier-Free Guidance.
-    This function explicitly separates conditional and unconditional paths using a DiT-based model.
-    Uses PixArt-alpha's TRANSFORMER architecture (DiT), not UNet.
+    Manual CFG implementation for DiT-based model.
+    Returns (PIL Image, diagnostics dict).
+    diagnostics contains per-step norms and final metadata.
     """
-    print(f"\nGenerating with w={guidance_scale} (Manual CFG)...", end=" ")
-    
-    # --- 1. Setup Model and Scheduler ---
+
+    print(f"Generating with CFG w={guidance_scale} using model '{model_id}' on {device}...")
+
+    # Load pipeline & scheduler
     pipe = DiffusionPipeline.from_pretrained(
         model_id,
-        torch_dtype=torch.float16 if 'cuda' in device else torch.float32,
-        cache_dir=CACHE_DIR
+        torch_dtype=torch.float16 if "cuda" in device else torch.float32,
+        cache_dir=CACHE_DIR,
     )
-    
-    # CRITICAL: Replace with DDIM scheduler as required
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    
     pipe = pipe.to(device)
-    
-    generator = torch.Generator(device=device).manual_seed(seed)
-    
-    # --- 2. Get Model Components (DiT uses TRANSFORMER not UNet) ---
-    transformer = pipe.transformer  # DiT transformer instead of UNet
+
+    transformer = pipe.transformer
     vae = pipe.vae
     scheduler = pipe.scheduler
-    text_encoder = pipe.text_encoder
     tokenizer = pipe.tokenizer
-    
-    # --- 3. Prepare Text Embeddings (The CRITICAL Part) ---
-    # Conditional embedding (for the prompt)
-    text_inputs = tokenizer(prompt, padding="max_length", max_length=120, truncation=True, return_tensors="pt")
+    text_encoder = pipe.text_encoder
+
+    # Get transformer dtype
+    try:
+        transformer_dtype = next(transformer.parameters()).dtype
+    except StopIteration:
+        transformer_dtype = torch.float16 if "cuda" in device else torch.float32
+
+    # Prepare conditional embeddings
+    text_inputs = tokenizer(prompt, padding="max_length", truncation=True, max_length=120, return_tensors="pt")
     cond_input_ids = text_inputs.input_ids.to(device)
     cond_attention_mask = text_inputs.attention_mask.to(device)
-    cond_embeddings = text_encoder(cond_input_ids, attention_mask=cond_attention_mask)[0]
-    
-    # Unconditional embedding (for an empty prompt)
+    with torch.no_grad():
+        cond_embeddings = text_encoder(cond_input_ids, attention_mask=cond_attention_mask)[0].to(device).to(transformer_dtype)
+    cond_attention_mask = cond_attention_mask.to(device)
+
+    # Prepare unconditional (empty) embeddings
     uncond_inputs = tokenizer("", padding="max_length", max_length=120, return_tensors="pt")
     uncond_input_ids = uncond_inputs.input_ids.to(device)
     uncond_attention_mask = uncond_inputs.attention_mask.to(device)
-    uncond_embeddings = text_encoder(uncond_input_ids, attention_mask=uncond_attention_mask)[0]
-    
-    # Concatenate for batched inference
-    text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
-    attention_masks = torch.cat([uncond_attention_mask, cond_attention_mask])
-    
-    # --- 4. Prepare Latents and Timesteps ---
+    with torch.no_grad():
+        uncond_embeddings = text_encoder(uncond_input_ids, attention_mask=uncond_attention_mask)[0].to(device).to(transformer_dtype)
+    uncond_attention_mask = uncond_attention_mask.to(device)
+
+    # Batch embeddings: [uncond, cond]
+    text_embeddings = torch.cat([uncond_embeddings, cond_embeddings], dim=0)
+    attention_masks = torch.cat([uncond_attention_mask, cond_attention_mask], dim=0)
+
+    # Timesteps
     scheduler.set_timesteps(num_inference_steps, device=device)
     timesteps = scheduler.timesteps
-    
-    # PixArt uses different latent dimensions
+
+    # Latent shape
     height = width = 512 if "512" in model_id else 1024
     latent_height = height // 8
     latent_width = width // 8
-    latent_channels = transformer.config.in_channels if hasattr(transformer.config, 'in_channels') else 4
-    
+    latent_channels = getattr(transformer.config, "in_channels", 4)
     latent_shape = (1, latent_channels, latent_height, latent_width)
-    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=cond_embeddings.dtype)
+
+    generator = torch.Generator(device=device).manual_seed(seed)
+    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=transformer_dtype)
     latents = latents * scheduler.init_noise_sigma
-    
-    # --- 5. Denoising Loop with Manual CFG ---
-    from tqdm import tqdm
-    for t in tqdm(timesteps, desc="Manual CFG Sampling", leave=False):
-        # Expand latents for batched inference (uncond + cond)
-        latent_model_input = torch.cat([latents] * 2)
+
+    # Diagnostics
+    diagnostics: Dict[str, List[Any]] = {
+        "timesteps": [],
+        "noise_mean_abs_uncond": [],
+        "noise_mean_abs_cond": [],
+        "noise_mean_abs_final": [],
+        "latents_mean_abs": [],
+    }
+
+    # Denoising loop with batched (uncond+cond) inference
+    print("Starting denoising loop with manual CFG...")
+    for i, t in enumerate(tqdm(timesteps, desc="Manual CFG Sampling", leave=False)):
+        # Expand latents for batched pred: two copies (uncond, cond)
+        latent_model_input = torch.cat([latents] * 2, dim=0)
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-        
-        # Ensure timestep is properly formatted (needs to be expanded for batch of 2)
-        current_timestep = torch.tensor([t] * latent_model_input.shape[0], device=device)
-        
-        # Predict noise for both unconditional and conditional using TRANSFORMER
+
+        # timestep tensor for the batch
+        current_timestep = torch.full((latent_model_input.shape[0],), int(t), device=device, dtype=torch.long)
+
+        # Predict noise for both uncond+cond
         noise_pred_batch = transformer(
-            latent_model_input,
+            latent_model_input.to(transformer_dtype),
             timestep=current_timestep,
             encoder_hidden_states=text_embeddings,
             encoder_attention_mask=attention_masks,
             return_dict=False
         )[0]
-        
-        # PixArt transformer outputs 8 channels: [noise (4), variance (4)]
-        # We only need the first 4 channels (the noise prediction)
+
         if noise_pred_batch.shape[1] == 8:
             noise_pred_batch = noise_pred_batch[:, :4, :, :]
-        
-        # Separate the predictions
-        noise_pred_uncond, noise_pred_cond = noise_pred_batch.chunk(2)
-        
-        # --- THIS IS THE CFG FORMULA ---
-        # When w=0, this correctly becomes `noise_pred = noise_pred_uncond`
+
+        # split predictions
+        noise_pred_uncond, noise_pred_cond = noise_pred_batch.chunk(2, dim=0)
+
+        # diagnostics before CFG
+        diagnostics["timesteps"].append(int(t))
+        diagnostics["noise_mean_abs_uncond"].append(float(noise_pred_uncond.abs().mean().cpu().item()))
+        diagnostics["noise_mean_abs_cond"].append(float(noise_pred_cond.abs().mean().cpu().item()))
+        diagnostics["latents_mean_abs"].append(float(latents.abs().mean().cpu().item()))
+
+        # CFG combination
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-        
-        # Compute previous latent state
-        latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-    
-    # --- 6. Decode Final Latent to Image ---
+
+        # Optionally clamp final noise for stability
+        if use_clamp:
+            noise_pred = noise_pred.clamp(-clamp_value, clamp_value)
+
+        diagnostics["noise_mean_abs_final"].append(float(noise_pred.abs().mean().cpu().item()))
+
+        # Step scheduler (use return_dict=True)
+        scheduler_output = scheduler.step(noise_pred, t, latents, return_dict=True)
+        prev_sample = getattr(scheduler_output, "prev_sample", None)
+        if prev_sample is None:
+            prev_sample = scheduler_output[0] if isinstance(scheduler_output, (tuple, list)) else None
+
+        # update latents for next step
+        if prev_sample is None:
+            raise RuntimeError("Scheduler did not return prev_sample; cannot continue sampling.")
+        latents = prev_sample
+
+    # Decode final latents to image
     with torch.no_grad():
-        scaling_factor = vae.config.scaling_factor if hasattr(vae.config, 'scaling_factor') else 0.18215
-        image = vae.decode(latents / scaling_factor, return_dict=False)[0]
-    
-    image = (image / 2 + 0.5).clamp(0, 1)
-    image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-    image = (image * 255).round().astype("uint8")
-    image = Image.fromarray(image[0])
-    
-    print("✓")
-    return image
+        scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
+        vae_dtype = next(vae.parameters()).dtype
+        decoded = vae.decode((latents / scaling_factor).to(vae_dtype), return_dict=False)[0]
+        image = (decoded / 2 + 0.5).clamp(0, 1)
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        image = (image * 255).round().astype("uint8")
+        pil = Image.fromarray(image[0])
+
+    meta = {"model_id": model_id, "prompt": prompt, "guidance_scale": guidance_scale, "seed": seed}
+    out = {"image": pil, "diagnostics": diagnostics, "meta": meta}
+    print("Done generating.")
+    return pil, out
  
 
 # %%
 # Test manual CFG with different guidance scales
-print("Testing Manual CFG Implementation")
-print("="*60)
+# Test CFG generation at different scales
+print("Testing manual CFG implementation...\n")
 
 test_prompt = "a beautiful mountain landscape with a lake at sunset"
 test_scales = [1.0, 5.0, 7.5, 10.0]
+device = "cuda:0"
 
 fig, axes = plt.subplots(1, len(test_scales), figsize=(20, 5))
-
-for idx, w in enumerate(test_scales):
-    image = generate_with_cfg(
+for i, w in enumerate(test_scales):
+    pil_img, _ = generate_with_cfg(
         prompt=test_prompt,
         guidance_scale=w,
-        num_inference_steps=30,  # Fewer steps for faster testing
+        num_inference_steps=30,
         seed=42,
         device=device,
-        model_id=DEFAULT_MODEL
     )
-    axes[idx].imshow(image)
-    axes[idx].set_title(f'CFG w={w}', fontsize=14)
-    axes[idx].axis('off')
+    axes[i].imshow(pil_img)
+    axes[i].set_title(f"CFG w={w}", fontsize=14)
+    axes[i].axis("off")
 
-plt.suptitle(f'Manual CFG Implementation\nPrompt: "{test_prompt}"', fontsize=16)
+plt.suptitle(f"Manual CFG Comparison\nPrompt: '{test_prompt}'", fontsize=16)
 plt.tight_layout()
-plt.savefig('manual_cfg_comparison.png', dpi=150, bbox_inches='tight')
+plt.savefig("manual_cfg_comparison.png", dpi=150, bbox_inches="tight")
 plt.show()
 
-print("\nSaved manual CFG comparison")
-
 # %%
-batch_size = 1
-conditional_example = torch.randn(batch_size, 3, 4, 4)
-unconditional_example = torch.randn(batch_size, 3, 4, 4)
-
-print("\nExample predictions:")
-print(f"Conditional prediction mean: {conditional_example.mean():.4f}")
-print(f"Unconditional prediction mean: {unconditional_example.mean():.4f}")
-
-print("\nCFG with different guidance scales:")
-for w in [0, 1, 2, 5, 7.5, 10]:
-    result = classifier_free_guidance(conditional_example, unconditional_example, w)
-    print(f"  w={w:4.1f}: Result mean = {result.mean():.4f}")
-
-print("\nObservations:")
-print("- w=0: Result equals unconditional (prompt ignored)")
-print("- w=1: Simple average of conditional and unconditional")
-print("- w>1: Amplifies the difference, strengthening prompt adherence")
-
-# %%
-
-
-
-# %% [markdown]
-# # Sensitivity Analysis for Guidance Scale
-# Analyze the effects of varying the guidance scale (e.g., w from 0-10) on sample quality and diversity.
-
-# %%
+# Sensitivity Analysis Function
 def cfg_sensitivity_analysis(
     prompt="a beautiful mountain landscape with lakes and forests",
     guidance_scales=[0, 1, 2, 5, 7.5, 10],
-    num_inference_steps=50,
-    seeds=[42, 123, 456],  # Multiple seeds for diversity analysis
-    device='cuda'
+    num_inference_steps=30,
+    seeds=[42, 123, 999],
+    device="cuda:0",
 ):
-    """
-    Perform sensitivity analysis for different guidance scales.
-    
-    Args:
-        prompt: Text prompt
-        guidance_scales: List of guidance scales to test
-        num_inference_steps: Number of denoising steps
-        seeds: List of random seeds (for diversity analysis)
-        device: Device to use
-    
-    Returns:
-        Dictionary mapping guidance_scale -> list of images
-    """
     results = {}
-    
-    print("="*60)
-    print("CFG Sensitivity Analysis")
-    print("="*60)
-    print(f"Prompt: '{prompt}'")
-    print(f"Testing guidance scales: {guidance_scales}")
-    print(f"Number of samples per scale: {len(seeds)}")
-    print("="*60)
-    
     for w in guidance_scales:
-        print(f"\nGenerating samples with guidance scale w={w}...")
-        images = []
-        
-        for seed_idx, seed in enumerate(seeds):
-            image = generate_with_cfg(
+        print(f"\nGenerating for w={w}")
+        results[w] = []
+        for s in seeds:
+            pil_img, _ = generate_with_cfg(
                 prompt=prompt,
-                num_inference_steps=num_inference_steps,
                 guidance_scale=w,
-                seed=seed,
-                device=device
+                num_inference_steps=num_inference_steps,
+                seed=s,
+                device=device,
             )
-            images.append(image)
-            print(f"  Generated sample {seed_idx + 1}/{len(seeds)}")
-        
-        results[w] = images
-    
+            results[w].append(pil_img)
     return results
 
 
 # %%
-print("\n" + "="*80)
-print("CLASSIFIER-FREE GUIDANCE (CFG) ANALYSIS")
-print("="*80)
+# Run Sensitivity Analysis
+prompt = "a cozy cabin by a lake surrounded by pine forests"
+prompt1 = "an airplane flying in space"
+prompt2 = "a futuristic city skyline at night with neon lights"
 
-# Part 1: Show the explicit CFG formula with visual representation
-print("\n1. CFG Formula Demonstration:")
-print("-" * 80)
-print("   noise_pred_final = noise_pred_uncond + w × (noise_pred_cond - noise_pred_uncond)")
-print("   where:")
-print("     - noise_pred_cond: prediction WITH prompt")
-print("     - noise_pred_uncond: prediction WITHOUT prompt (empty string)")
-print("     - w (guidance scale): controls strength of prompt adherence")
-print("-" * 80)
+guidance_values = [0, 1, 2, 5, 7.5, 10]
+results = cfg_sensitivity_analysis(prompt=prompt, guidance_scales=guidance_values, device=device)
+results1 = cfg_sensitivity_analysis(prompt=prompt1, guidance_scales=guidance_values, device=device)
+results2 = cfg_sensitivity_analysis(prompt=prompt2, guidance_scales=guidance_values, device=device)
 
-# Part 2: Generate comparison across different w values
-comparison_prompt = "a serene mountain landscape with a crystal clear lake at sunset"
-guidance_scales = [0, 1.0, 3.0, 5.0, 7.5, 10.0]
-seed = 42
-
-print(f"\n2. Generating samples with different guidance scales...")
-print(f"   Prompt: '{comparison_prompt}'")
-print(f"   Seed: {seed} (same for all - to isolate effect of w)")
-print(f"   Guidance scales to test: {guidance_scales}\n")
-
-cfg_comparison_images = {}
-
-for w in guidance_scales:
-    print(f"   Generating with w={w}...", end=" ")
-    image = generate_with_cfg(
-        prompt=comparison_prompt,
-        guidance_scale=w,
-        seed=seed,
-        num_inference_steps=50,
-        device=device,
-        model_id=DEFAULT_MODEL
-    )
-    cfg_comparison_images[w] = image
-    print("✓")
-
-# Visualize with detailed labels
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-axes = axes.flatten()
-
-for idx, w in enumerate(guidance_scales):
-    axes[idx].imshow(cfg_comparison_images[w])
-    
-    # Create detailed title based on guidance scale
-    if w == 0:
-        title = f'w = {w}\n(Unconditional)\nPrompt IGNORED'
-        color = 'red'
-    elif w == 1.0:
-        title = f'w = {w}\n(Balanced)\nEqual weighting'
-        color = 'orange'
-    elif w <= 5.0:
-        title = f'w = {w}\n(Moderate Guidance)\nGood balance'
-        color = 'green'
-    elif w == 7.5:
-        title = f'w = {w}\n(Strong Guidance)\nSD default, high quality'
-        color = 'blue'
-    else:
-        title = f'w = {w}\n(Very Strong)\nMay over-saturate'
-        color = 'purple'
-    
-    axes[idx].set_title(title, fontsize=14, fontweight='bold', color=color, pad=10)
-    axes[idx].axis('off')
-    
-    # Add colored border
-    for spine in axes[idx].spines.values():
-        spine.set_edgecolor(color)
-        spine.set_linewidth(3)
-        spine.set_visible(True)
-
-plt.suptitle(
-    f'Classifier-Free Guidance (CFG) Sensitivity Analysis\n'
-    f'Prompt: "{comparison_prompt}"\n'
-    f'Formula: final = uncond + w × (cond - uncond)',
-    fontsize=16, fontweight='bold', y=0.98
-)
-
-# Add explanation box
-explanation = (
-    "KEY OBSERVATIONS:\n"
-    "• w=0: Ignores prompt completely (unconditional generation)\n"
-    "• w=1: Baseline (conditional and unconditional equally weighted)\n"
-    "• w=3-5: Moderate guidance (good quality-diversity trade-off)\n"
-    "• w=7.5: Strong guidance (Stable Diffusion default, high prompt adherence)\n"
-    "• w=10+: Very strong guidance (may reduce diversity, over-saturate colors)\n\n"
-    "TRADE-OFF: Higher w → Better prompt adherence but less diversity"
-)
-
-fig.text(0.5, 0.02, explanation, fontsize=11, ha='center', 
-         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
-         family='monospace')
-
-plt.tight_layout(rect=[0, 0.12, 1, 0.96])
-plt.savefig('cfg_sensitivity_detailed.png', dpi=200, bbox_inches='tight')
+# Visualize results (first seed for each w)
+fig, axes = plt.subplots(1, len(guidance_values), figsize=(25, 6))
+for i, w in enumerate(guidance_values):
+    axes[i].imshow(results[w][0])
+    axes[i].set_title(f"w={w}", fontsize=14)
+    axes[i].axis("off")
+plt.suptitle(f"CFG Sensitivity Analysis — Prompt: '{prompt}'", fontsize=18)
+plt.tight_layout()
+plt.savefig("cfg_sensitivity_analysis.png", dpi=150, bbox_inches="tight")
 plt.show()
 
-print("\n✓ Saved detailed CFG sensitivity analysis")
+fig1, axes1 = plt.subplots(1, len(guidance_values), figsize=(25, 6))
+for i, w in enumerate(guidance_values):
+    axes1[i].imshow(results1[w][0])
+    axes1[i].set_title(f"w={w}", fontsize=14)
+    axes1[i].axis("off")
+plt.suptitle(f"CFG Sensitivity Analysis — Prompt: '{prompt1}'", fontsize=18)
+plt.tight_layout()
+plt.savefig("cfg_sensitivity_analysis1.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+fig2, axes2 = plt.subplots(1, len(guidance_values), figsize=(25, 6))
+for i, w in enumerate(guidance_values):
+    axes2[i].imshow(results2[w][0])
+    axes2[i].set_title(f"w={w}", fontsize=14)
+    axes2[i].axis("off")
+plt.suptitle(f"CFG Sensitivity Analysis — Prompt: '{prompt2}'", fontsize=18)
+plt.tight_layout()
+plt.savefig("cfg_sensitivity_analysis2.png", dpi=150, bbox_inches="tight")
+plt.show()

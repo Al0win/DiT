@@ -29,19 +29,29 @@ def load_trained_model(checkpoint_path, device='cuda'):
     patch_size = config.get('patch_size', 2)
     depth = config.get('depth', 8)
     num_heads = config.get('num_heads', 6)
-    num_timesteps = config.get('num_timesteps', 1000)
+    num_timesteps = config.get('timesteps', config.get('num_timesteps', 1000))
     use_vae = config.get('use_vae', False)
     latent_mode = config.get('latent_mode', False)
     
-    print(f"  Config: patch={patch_size}, depth={depth}, heads={num_heads}, T={num_timesteps}, VAE={use_vae}")
+    # Infer architecture from checkpoint shapes
+    model_state = checkpoint['model_state_dict']
     
-    # Determine dimensions based on latent mode
-    if latent_mode or use_vae:
-        img_size = 32  # Latent space is 32x32
-        in_channels = 4  # VAE latents have 4 channels
-    else:
-        img_size = 128  # Pixel space is 128x128
-        in_channels = 3  # RGB has 3 channels
+    # Get input channels from patch_embed weight shape
+    in_channels = model_state['patch_embed.proj.weight'].shape[1]
+    
+    # Get number of patches from pos_embed shape
+    num_patches = model_state['pos_embed'].shape[1]
+    
+    # Calculate img_size from num_patches and patch_size
+    # num_patches = (img_size / patch_size) ^ 2
+    patches_per_side = int(num_patches ** 0.5)
+    img_size = patches_per_side * patch_size
+    
+    # Determine if using VAE based on channels
+    use_vae = (in_channels == 4)
+    
+    print(f"  Config: patch={patch_size}, depth={depth}, heads={num_heads}, T={num_timesteps}, VAE={use_vae}")
+    print(f"  Inferred: in_channels={in_channels}, img_size={img_size}, num_patches={num_patches}")
     
     # Initialize model
     model = DiT(
@@ -76,25 +86,33 @@ def load_trained_model(checkpoint_path, device='cuda'):
 
 @torch.no_grad()
 def generate_evolution_grid(model, noise_scheduler, vae_wrapper=None, 
-                           num_steps=100, device='cuda', seed=42):
+                           num_steps=100, device='cuda', seed=42, img_size=None, in_channels=None, initial_noise=None):
     """
     Generate a 10x10 grid showing evolution from noise to clean image.
     
     Similar to the pretrained model visualization, captures x_0 prediction
     at each step during the denoising process.
     """
-    torch.manual_seed(seed)
-    
     # Determine image/latent dimensions
-    if vae_wrapper is not None:
-        img_size = 32  # Latent space
-        channels = 4   # VAE latents
+    if img_size is None or in_channels is None:
+        if vae_wrapper is not None:
+            img_size = 32  # Latent space
+            channels = 4   # VAE latents
+        else:
+            img_size = 128  # Pixel space
+            channels = 3    # RGB
     else:
-        img_size = 128  # Pixel space
-        channels = 3    # RGB
+        channels = in_channels
+
+    # Use provided initial noise or generate new
+    if initial_noise is not None:
+        x = initial_noise.clone().to(device)
+    else:
+        torch.manual_seed(seed)
+        x = torch.randn(1, channels, img_size, img_size, device=device)
     
-    # Initialize random noise
-    x = torch.randn(1, channels, img_size, img_size, device=device)
+    # Create a generator for reproducible noise during denoising
+    generator = torch.Generator(device=device).manual_seed(seed)
     
     # Sample timesteps uniformly
     step_size = noise_scheduler.num_timesteps // num_steps
@@ -149,14 +167,14 @@ def generate_evolution_grid(model, noise_scheduler, vae_wrapper=None,
             
             # Add noise if not at the last step
             if t_prev > 0:
-                noise = torch.randn_like(x)
+                noise = torch.randn(x.shape, device=device, generator=generator)
                 posterior_variance = noise_scheduler.posterior_variance[t]
                 x = x + torch.sqrt(posterior_variance) * noise
     
     return x0_predictions
 
 
-def visualize_single_experiment(exp_dir, output_dir, device='cuda', seed=42):
+def visualize_single_experiment(exp_dir, output_dir, device='cuda', seed=42, initial_noise=None):
     """Visualize evolution for a single experiment."""
     exp_name = os.path.basename(exp_dir)
     checkpoint_path = os.path.join(exp_dir, f"{exp_name}_checkpoint.pth")
@@ -172,10 +190,16 @@ def visualize_single_experiment(exp_dir, output_dir, device='cuda', seed=42):
     # Load model
     model, noise_scheduler, vae_wrapper, config = load_trained_model(checkpoint_path, device)
     
+    # Get model dimensions
+    img_size = model.img_size
+    in_channels = model.in_channels
+    
     # Generate evolution grid
     x0_predictions = generate_evolution_grid(
         model, noise_scheduler, vae_wrapper, 
-        num_steps=100, device=device, seed=seed
+        num_steps=100, device=device, seed=seed,
+        img_size=img_size, in_channels=in_channels,
+        initial_noise=initial_noise
     )
     
     # Create 10x10 grid
@@ -229,9 +253,21 @@ def visualize_all_experiments(experiments_root, output_dir, device='cuda', seed=
     
     print(f"\nFound {len(exp_dirs)} experiments to visualize")
     
+    # Determine reference noise shape from the first experiment
+    if not exp_dirs:
+        print("No experiments found.")
+        return
+    # Load first checkpoint to get shape
+    model, noise_scheduler, vae_wrapper, config = load_trained_model(
+        os.path.join(exp_dirs[0], f"{os.path.basename(exp_dirs[0])}_checkpoint.pth"), device)
+    img_size = model.img_size
+    in_channels = model.in_channels
+    torch.manual_seed(seed)
+    initial_noise = torch.randn(1, in_channels, img_size, img_size, device=device)
+
     for exp_dir in exp_dirs:
         try:
-            visualize_single_experiment(exp_dir, output_dir, device, seed)
+            visualize_single_experiment(exp_dir, output_dir, device, seed, initial_noise=initial_noise)
         except Exception as e:
             print(f"Error processing {exp_dir}: {e}")
             import traceback

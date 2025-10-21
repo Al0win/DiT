@@ -416,104 +416,70 @@ def cfg_sensitivity_analysis(
     return results
 
 
+
 # %%
-print("\n" + "="*80)
-print("CLASSIFIER-FREE GUIDANCE (CFG) ANALYSIS")
-print("="*80)
+# Sensitivity Analysis in the same format and prompts as dit_cfg_using_pixelart.py
+def cfg_sensitivity_analysis(
+    prompt="a beautiful mountain landscape with lakes and forests",
+    guidance_scales=[0, 1, 2, 5, 7.5, 10],
+    num_inference_steps=30,
+    seeds=[42, 123, 999],
+    device="cuda:1",
+):
+    results = {}
+    for w in guidance_scales:
+        print(f"\nGenerating for w={w}")
+        results[w] = []
+        for s in seeds:
+            img = generate_with_cfg(
+                prompt=prompt,
+                guidance_scale=w,
+                num_inference_steps=num_inference_steps,
+                seed=s,
+                device=device,
+            )
+            results[w].append(img)
+    return results
 
-# Part 1: Show the explicit CFG formula with visual representation
-print("\n1. CFG Formula Demonstration:")
-print("-" * 80)
-print("   noise_pred_final = noise_pred_uncond + w × (noise_pred_cond - noise_pred_uncond)")
-print("   where:")
-print("     - noise_pred_cond: prediction WITH prompt")
-print("     - noise_pred_uncond: prediction WITHOUT prompt (empty string)")
-print("     - w (guidance scale): controls strength of prompt adherence")
-print("-" * 80)
+# Run Sensitivity Analysis for three prompts (same as pixelart version)
+prompt = "a cozy cabin by a lake surrounded by pine forests"
+prompt1 = "an airplane flying in space"
+prompt2 = "a futuristic city skyline at night with neon lights"
 
-# Part 2: Generate comparison across different w values
-comparison_prompt = "a serene mountain landscape with a crystal clear lake at sunset"
-guidance_scales = [0, 1.0, 3.0, 5.0, 7.5, 10.0]
-seed = 42
+guidance_values = [0, 1, 2, 5, 7.5, 10]
+results = cfg_sensitivity_analysis(prompt=prompt, guidance_scales=guidance_values, device=device)
+results1 = cfg_sensitivity_analysis(prompt=prompt1, guidance_scales=guidance_values, device=device)
+results2 = cfg_sensitivity_analysis(prompt=prompt2, guidance_scales=guidance_values, device=device)
 
-print(f"\n2. Generating samples with different guidance scales...")
-print(f"   Prompt: '{comparison_prompt}'")
-print(f"   Seed: {seed} (same for all - to isolate effect of w)")
-print(f"   Guidance scales to test: {guidance_scales}\n")
-
-cfg_comparison_images = {}
-
-for w in guidance_scales:
-    print(f"   Generating with w={w}...", end=" ")
-    image = generate_with_cfg(
-        prompt=comparison_prompt,
-        guidance_scale=w,
-        seed=seed,
-        num_inference_steps=50,
-        device=device
-    )
-    cfg_comparison_images[w] = image
-    print("✓")
-
-# Visualize with detailed labels
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-axes = axes.flatten()
-
-for idx, w in enumerate(guidance_scales):
-    axes[idx].imshow(cfg_comparison_images[w])
-    
-    # Create detailed title based on guidance scale
-    if w == 0:
-        title = f'w = {w}\n(Unconditional)\nPrompt IGNORED'
-        color = 'red'
-    elif w == 1.0:
-        title = f'w = {w}\n(Balanced)\nEqual weighting'
-        color = 'orange'
-    elif w <= 5.0:
-        title = f'w = {w}\n(Moderate Guidance)\nGood balance'
-        color = 'green'
-    elif w == 7.5:
-        title = f'w = {w}\n(Strong Guidance)\nSD default, high quality'
-        color = 'blue'
-    else:
-        title = f'w = {w}\n(Very Strong)\nMay over-saturate'
-        color = 'purple'
-    
-    axes[idx].set_title(title, fontsize=14, fontweight='bold', color=color, pad=10)
-    axes[idx].axis('off')
-    
-    # Add colored border
-    for spine in axes[idx].spines.values():
-        spine.set_edgecolor(color)
-        spine.set_linewidth(3)
-        spine.set_visible(True)
-
-plt.suptitle(
-    f'Classifier-Free Guidance (CFG) Sensitivity Analysis\n'
-    f'Prompt: "{comparison_prompt}"\n'
-    f'Formula: final = uncond + w × (cond - uncond)',
-    fontsize=16, fontweight='bold', y=0.98
-)
-
-# Add explanation box
-explanation = (
-    "KEY OBSERVATIONS:\n"
-    "• w=0: Ignores prompt completely (unconditional generation)\n"
-    "• w=1: Baseline (conditional and unconditional equally weighted)\n"
-    "• w=3-5: Moderate guidance (good quality-diversity trade-off)\n"
-    "• w=7.5: Strong guidance (Stable Diffusion default, high prompt adherence)\n"
-    "• w=10+: Very strong guidance (may reduce diversity, over-saturate colors)\n\n"
-    "TRADE-OFF: Higher w → Better prompt adherence but less diversity"
-)
-
-fig.text(0.5, 0.02, explanation, fontsize=11, ha='center', 
-         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
-         family='monospace')
-
-plt.tight_layout(rect=[0, 0.12, 1, 0.96])
-plt.savefig('cfg_sensitivity_detailed.png', dpi=200, bbox_inches='tight')
+# Visualize results (first seed for each w)
+fig, axes = plt.subplots(1, len(guidance_values), figsize=(25, 6))
+for i, w in enumerate(guidance_values):
+    axes[i].imshow(results[w][0])
+    axes[i].set_title(f"w={w}", fontsize=14)
+    axes[i].axis("off")
+plt.suptitle(f"CFG Sensitivity Analysis — Prompt: '{prompt}'", fontsize=18)
+plt.tight_layout()
+plt.savefig("cfg_sensitivity_analysis.png", dpi=150, bbox_inches="tight")
 plt.show()
 
-print("\n✓ Saved detailed CFG sensitivity analysis")
+fig1, axes1 = plt.subplots(1, len(guidance_values), figsize=(25, 6))
+for i, w in enumerate(guidance_values):
+    axes1[i].imshow(results1[w][0])
+    axes1[i].set_title(f"w={w}", fontsize=14)
+    axes1[i].axis("off")
+plt.suptitle(f"CFG Sensitivity Analysis — Prompt: '{prompt1}'", fontsize=18)
+plt.tight_layout()
+plt.savefig("cfg_sensitivity_analysis1.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+fig2, axes2 = plt.subplots(1, len(guidance_values), figsize=(25, 6))
+for i, w in enumerate(guidance_values):
+    axes2[i].imshow(results2[w][0])
+    axes2[i].set_title(f"w={w}", fontsize=14)
+    axes2[i].axis("off")
+plt.suptitle(f"CFG Sensitivity Analysis — Prompt: '{prompt2}'", fontsize=18)
+plt.tight_layout()
+plt.savefig("cfg_sensitivity_analysis2.png", dpi=150, bbox_inches="tight")
+plt.show()
 
 

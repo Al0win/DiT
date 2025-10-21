@@ -168,38 +168,8 @@ OUTPUT_DIR = "/mnt/local/hf/DiT/visualizations/trained_models"
 
 ---
 
-### 6. `test_dit_setup.py` - Setup Verification
-**Purpose**: Verify pretrained DiT model setup before running full scripts.
 
-**Features**:
-- Tests model loading (PixArt-alpha)
-- Verifies DDIM scheduler replacement
-- Tests manual CFG implementation
-- Checks DiT architecture (transformer, not UNet)
-- Confirms correct cache location
-
-**Usage**:
-```bash
-export HF_HOME=/mnt/local/hf/huggingface_cache
-export TRANSFORMERS_CACHE=/mnt/local/hf/huggingface_cache
-export HF_DATASETS_CACHE=/mnt/local/hf/huggingface_cache
-python test_dit_setup.py
-```
-
-**Expected Output**:
-```
-✅ SUCCESS! DiT model with Manual CFG & DDIM is working!
-Key verifications:
-  ✓ DiT architecture (transformer-based, not UNet)
-  ✓ DDIM scheduler
-  ✓ Manual CFG implementation
-  ✓ Text prompt support
-  ✓ Correct cache location (/mnt/local/hf)
-```
-
----
-
-### 7. `compare_pixel_vs_latent.py` - Training Comparison
+### 6. `compare_pixel_vs_latent.py` - Training Comparison
 **Purpose**: Compare pixel-space vs latent-space DiT training.
 
 **Features**:
