@@ -20,6 +20,16 @@ from torchvision.utils import make_grid
 from scipy import linalg
 from torchvision.models import inception_v3
 
+CACHE_DIR = "/mnt/local/hf/huggingface_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Set environment variables for HuggingFace cache (MUST be set before loading models)
+os.environ['HF_HOME'] = CACHE_DIR
+os.environ['TRANSFORMERS_CACHE'] = CACHE_DIR
+os.environ['HF_DATASETS_CACHE'] = CACHE_DIR
+os.environ['HF_METRICS_CACHE'] = CACHE_DIR
+os.environ['XDG_CACHE_HOME'] = CACHE_DIR
+
 # VAE imports
 try:
     from diffusers.models import AutoencoderKL
@@ -606,10 +616,6 @@ class VAEWrapper:
         """Get the number of latent channels (always 4 for SD VAE)"""
         return 4
 
-
-# ============================================================================
-# FID Computation
-# ============================================================================
 
 class InceptionFeatureExtractor:
     """Extract features from Inception v3 for FID calculation."""
