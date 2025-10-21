@@ -1,115 +1,74 @@
 # %% [markdown]
 # # Pre-trained DiT-based Diffusion Model Visualization
 # Visualize the evolving predictions of a pre-trained DiT-based diffusion model at various timesteps.
-# 
-# This implementation uses DiT (Diffusion Transformer) architecture instead of UNet-based models.
-# Default model: facebook/DiT-XL-2-256 (DiT-XL/2 trained on ImageNet at 256x256 resolution)
-# Alternative: black-forest-labs/FLUX.1-dev (more advanced DiT-based model)
-#
-# Key differences from UNet-based Stable Diffusion:
-# - Uses Transformer blocks instead of convolutional UNet
-# - DiT architecture as described in "Scalable Diffusion Models with Transformers" (Peebles & Xie, 2023)
 
 # %%
-from diffusers import DiffusionPipeline, DDIMScheduler
+from diffusers import StableDiffusionPipeline, DDIMScheduler
 import torch
 from PIL import Image
 import numpy as np
 from typing import List, Optional
-import os
-
-# Set cache directory to /mnt/local/hf to avoid filling up /home/jovyan
-CACHE_DIR = "/mnt/local/hf/huggingface_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-# Set environment variables for HuggingFace cache (MUST be set before loading models)
-os.environ['HF_HOME'] = CACHE_DIR
-os.environ['TRANSFORMERS_CACHE'] = CACHE_DIR
-os.environ['HF_DATASETS_CACHE'] = CACHE_DIR
-os.environ['HF_METRICS_CACHE'] = CACHE_DIR
-os.environ['XDG_CACHE_HOME'] = CACHE_DIR
-
-# Model selection - choose one:
-# - "facebook/DiT-XL-2-256": Original DiT model (256x256, ImageNet classes) - REQUIRES class labels, not text
-# - "black-forest-labs/FLUX.1-dev": Advanced DiT-based text-to-image model - REQUIRES authentication
-# - "PixArt-alpha/PixArt-XL-2-1024-MS": DiT-based text-to-image (1024x1024) - NO AUTH REQUIRED
-# - "PixArt-alpha/PixArt-XL-2-512x512": DiT-based text-to-image (512x512) - NO AUTH REQUIRED, faster
-DEFAULT_MODEL = "PixArt-alpha/PixArt-XL-2-512x512"
 
 @torch.no_grad()
 def visualize_diffusion_evolution_pretrained(
     num_inference_steps=100,
     prompt="a beautiful landscape with mountains and rivers",
     seed=42,
-    device='cuda',
-    model_id="PixArt-alpha/PixArt-XL-2-512x512"
+    device='cuda'
 ):
     """
     Visualize the evolving prediction of clean images at various timesteps
-    during the reverse diffusion process using a pre-trained DiT-based model.
+    during the reverse diffusion process using a pre-trained model.
     
     This captures the x_0 prediction at EACH step during a SINGLE denoising run.
-    Uses PixArt-alpha which has a TRANSFORMER architecture (DiT), not UNet.
     """
-    print(f"Loading pre-trained DiT-based model: {model_id}...")
+    print("Loading pre-trained Stable Diffusion model...")
     
-    # Load DiT-based model
-    pipe = DiffusionPipeline.from_pretrained(
+    # Load Stable Diffusion with DDIM scheduler
+    model_id = "CompVis/stable-diffusion-v1-4"
+    pipe = StableDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=torch.float16 if 'cuda' in device else torch.float32,
-        cache_dir=CACHE_DIR
+        safety_checker=None,
+        requires_safety_checker=False
     )
     
-    # IMPORTANT: Replace scheduler with DDIM for consistency
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    print(f"  Using DDIM scheduler (replaced {type(pipe.scheduler).__name__})")
-    
     pipe = pipe.to(device)
     
     # Set seed
     generator = torch.Generator(device=device).manual_seed(seed)
     
-    # Get model components - NOTE: DiT uses 'transformer' not 'unet'
-    transformer = pipe.transformer  # DiT transformer instead of UNet
+    # Get model components
+    unet = pipe.unet
     vae = pipe.vae
     scheduler = pipe.scheduler
     text_encoder = pipe.text_encoder
     tokenizer = pipe.tokenizer
     
-    # Encode prompt using T5 tokenizer
+    # Encode prompt
     text_inputs = tokenizer(
         prompt,
         padding="max_length",
-        max_length=120,  # PixArt uses max_length=120
+        max_length=tokenizer.model_max_length,
         truncation=True,
         return_tensors="pt",
     )
     text_input_ids = text_inputs.input_ids.to(device)
-    attention_mask = text_inputs.attention_mask.to(device)
     
     with torch.no_grad():
-        # T5 encoder returns encoder outputs
-        prompt_embeds = text_encoder(text_input_ids, attention_mask=attention_mask)[0]
-        prompt_attention_mask = attention_mask
+        text_embeddings = text_encoder(text_input_ids)[0]
     
     # Set timesteps
-    scheduler.set_timesteps(num_inference_steps, device=device)
+    scheduler.set_timesteps(num_inference_steps)
     timesteps = scheduler.timesteps
     
     # Create initial latent noise ONCE
-    # PixArt uses different latent dimensions than SD
-    height = width = 512 if "512" in model_id else 1024
-    latent_height = height // 8
-    latent_width = width // 8
-    latent_channels = transformer.config.in_channels if hasattr(transformer.config, 'in_channels') else 4
-    
-    latent_shape = (1, latent_channels, latent_height, latent_width)
-    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=prompt_embeds.dtype)
+    latent_shape = (1, unet.config.in_channels, 64, 64)
+    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=text_embeddings.dtype)
     latents = latents * scheduler.init_noise_sigma
     
     print(f"\nGenerating single image evolution with {num_inference_steps} steps...")
-    print(f"  Latent shape: {latent_shape}")
-    print(f"  Using DiT transformer: {type(transformer).__name__}")
     
     # Storage for intermediate predictions
     grid_images = []
@@ -117,47 +76,25 @@ def visualize_diffusion_evolution_pretrained(
     timestep_labels = []
     
     # Single continuous denoising loop
-    from tqdm import tqdm
     for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
-        # Expand latents if needed
         latent_model_input = scheduler.scale_model_input(latents, t)
         
-        # Ensure timestep is properly formatted for transformer (needs to be a tensor for batch)
-        current_timestep = torch.tensor([t], device=device)
-        
-        # Predict noise using TRANSFORMER (not UNet)
-        # PixArt transformer expects: sample, timestep, encoder_hidden_states, encoder_attention_mask
-        noise_pred = transformer(
+        # Predict noise
+        noise_pred = unet(
             latent_model_input,
-            timestep=current_timestep,
-            encoder_hidden_states=prompt_embeds,
-            encoder_attention_mask=prompt_attention_mask,
-            return_dict=False
-        )[0]
-        
-        # PixArt transformer outputs 8 channels: [noise (4), variance (4)]
-        # We only need the first 4 channels (the noise prediction)
-        if noise_pred.shape[1] == 8:
-            noise_pred = noise_pred[:, :4, :, :]
+            t,
+            encoder_hidden_states=text_embeddings
+        ).sample
         
         # Compute the previous noisy sample
-        scheduler_output = scheduler.step(noise_pred, t, latents, return_dict=True)
+        scheduler_output = scheduler.step(noise_pred, t, latents)
         
         # CAPTURE x_0 prediction BEFORE updating latents
-        if hasattr(scheduler_output, 'pred_original_sample') and scheduler_output.pred_original_sample is not None:
-            pred_original_sample = scheduler_output.pred_original_sample
-        else:
-            # Some schedulers don't return pred_original_sample, compute it manually
-            # For DDPM/DPMSolver: x_0 = (x_t - sqrt(1-alpha_t) * noise_pred) / sqrt(alpha_t)
-            alpha_prod_t = scheduler.alphas_cumprod[t]
-            beta_prod_t = 1 - alpha_prod_t
-            pred_original_sample = (latents - beta_prod_t ** 0.5 * noise_pred) / alpha_prod_t ** 0.5
+        pred_original_sample = scheduler_output.pred_original_sample
         
         # Decode and save this x_0 prediction
         with torch.no_grad():
-            # VAE expects latents to be scaled
-            scaling_factor = vae.config.scaling_factor if hasattr(vae.config, 'scaling_factor') else 0.18215
-            image = vae.decode(pred_original_sample / scaling_factor, return_dict=False)[0]
+            image = vae.decode(pred_original_sample / vae.config.scaling_factor).sample
         
         # Convert to PIL
         image = (image / 2 + 0.5).clamp(0, 1)
@@ -191,8 +128,7 @@ predictions, labels, grid_images = visualize_diffusion_evolution_pretrained(
     num_inference_steps=100,
     prompt="a beautiful landscape with mountains, lakes and forests",
     seed=42,
-    device=device,
-    model_id=DEFAULT_MODEL
+    device=device
 )
 
 # Visualize the evolution of predictions
@@ -293,32 +229,29 @@ def generate_with_cfg(
     num_inference_steps=50,
     guidance_scale=7.5,
     seed=42,
-    device='cuda',
-    model_id="PixArt-alpha/PixArt-XL-2-512x512"
+    device='cuda'
 ):
     """
     Generate an image with a MANUAL and CORRECT implementation of Classifier-Free Guidance.
-    This function explicitly separates conditional and unconditional paths using a DiT-based model.
-    Uses PixArt-alpha's TRANSFORMER architecture (DiT), not UNet.
+    This function explicitly separates conditional and unconditional paths to fix the w=0 bug.
     """
     print(f"\nGenerating with w={guidance_scale} (Manual CFG)...", end=" ")
     
     # --- 1. Setup Model and Scheduler ---
-    pipe = DiffusionPipeline.from_pretrained(
+    model_id = "CompVis/stable-diffusion-v1-4"
+    pipe = StableDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=torch.float16 if 'cuda' in device else torch.float32,
-        cache_dir=CACHE_DIR
+        safety_checker=None,
+        requires_safety_checker=False
     )
-    
-    # CRITICAL: Replace with DDIM scheduler as required
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    
     pipe = pipe.to(device)
     
     generator = torch.Generator(device=device).manual_seed(seed)
     
-    # --- 2. Get Model Components (DiT uses TRANSFORMER not UNet) ---
-    transformer = pipe.transformer  # DiT transformer instead of UNet
+    # --- 2. Get Model Components ---
+    unet = pipe.unet
     vae = pipe.vae
     scheduler = pipe.scheduler
     text_encoder = pipe.text_encoder
@@ -326,58 +259,32 @@ def generate_with_cfg(
     
     # --- 3. Prepare Text Embeddings (The CRITICAL Part) ---
     # Conditional embedding (for the prompt)
-    text_inputs = tokenizer(prompt, padding="max_length", max_length=120, truncation=True, return_tensors="pt")
-    cond_input_ids = text_inputs.input_ids.to(device)
-    cond_attention_mask = text_inputs.attention_mask.to(device)
-    cond_embeddings = text_encoder(cond_input_ids, attention_mask=cond_attention_mask)[0]
+    text_inputs = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+    cond_embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
     
     # Unconditional embedding (for an empty prompt)
-    uncond_inputs = tokenizer("", padding="max_length", max_length=120, return_tensors="pt")
-    uncond_input_ids = uncond_inputs.input_ids.to(device)
-    uncond_attention_mask = uncond_inputs.attention_mask.to(device)
-    uncond_embeddings = text_encoder(uncond_input_ids, attention_mask=uncond_attention_mask)[0]
+    uncond_inputs = tokenizer("", padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+    uncond_embeddings = text_encoder(uncond_inputs.input_ids.to(device))[0]
     
     # Concatenate for batched inference
     text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
-    attention_masks = torch.cat([uncond_attention_mask, cond_attention_mask])
     
     # --- 4. Prepare Latents and Timesteps ---
-    scheduler.set_timesteps(num_inference_steps, device=device)
+    scheduler.set_timesteps(num_inference_steps)
     timesteps = scheduler.timesteps
     
-    # PixArt uses different latent dimensions
-    height = width = 512 if "512" in model_id else 1024
-    latent_height = height // 8
-    latent_width = width // 8
-    latent_channels = transformer.config.in_channels if hasattr(transformer.config, 'in_channels') else 4
-    
-    latent_shape = (1, latent_channels, latent_height, latent_width)
+    latent_shape = (1, unet.config.in_channels, 64, 64)
     latents = torch.randn(latent_shape, generator=generator, device=device, dtype=cond_embeddings.dtype)
     latents = latents * scheduler.init_noise_sigma
     
     # --- 5. Denoising Loop with Manual CFG ---
-    from tqdm import tqdm
     for t in tqdm(timesteps, desc="Manual CFG Sampling", leave=False):
         # Expand latents for batched inference (uncond + cond)
         latent_model_input = torch.cat([latents] * 2)
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
         
-        # Ensure timestep is properly formatted (needs to be expanded for batch of 2)
-        current_timestep = torch.tensor([t] * latent_model_input.shape[0], device=device)
-        
-        # Predict noise for both unconditional and conditional using TRANSFORMER
-        noise_pred_batch = transformer(
-            latent_model_input,
-            timestep=current_timestep,
-            encoder_hidden_states=text_embeddings,
-            encoder_attention_mask=attention_masks,
-            return_dict=False
-        )[0]
-        
-        # PixArt transformer outputs 8 channels: [noise (4), variance (4)]
-        # We only need the first 4 channels (the noise prediction)
-        if noise_pred_batch.shape[1] == 8:
-            noise_pred_batch = noise_pred_batch[:, :4, :, :]
+        # Predict noise for both unconditional and conditional
+        noise_pred_batch = unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
         
         # Separate the predictions
         noise_pred_uncond, noise_pred_cond = noise_pred_batch.chunk(2)
@@ -387,12 +294,11 @@ def generate_with_cfg(
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
         
         # Compute previous latent state
-        latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
     
     # --- 6. Decode Final Latent to Image ---
     with torch.no_grad():
-        scaling_factor = vae.config.scaling_factor if hasattr(vae.config, 'scaling_factor') else 0.18215
-        image = vae.decode(latents / scaling_factor, return_dict=False)[0]
+        image = vae.decode(latents / vae.config.scaling_factor).sample
     
     image = (image / 2 + 0.5).clamp(0, 1)
     image = image.cpu().permute(0, 2, 3, 1).float().numpy()
@@ -419,8 +325,7 @@ for idx, w in enumerate(test_scales):
         guidance_scale=w,
         num_inference_steps=30,  # Fewer steps for faster testing
         seed=42,
-        device=device,
-        model_id=DEFAULT_MODEL
+        device=device
     )
     axes[idx].imshow(image)
     axes[idx].set_title(f'CFG w={w}', fontsize=14)
@@ -496,7 +401,7 @@ def cfg_sensitivity_analysis(
         images = []
         
         for seed_idx, seed in enumerate(seeds):
-            image = generate_with_cfg(
+            image = generate_with_cfg_pretrained(
                 prompt=prompt,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=w,
@@ -545,8 +450,7 @@ for w in guidance_scales:
         guidance_scale=w,
         seed=seed,
         num_inference_steps=50,
-        device=device,
-        model_id=DEFAULT_MODEL
+        device=device
     )
     cfg_comparison_images[w] = image
     print("✓")
