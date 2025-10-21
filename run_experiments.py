@@ -33,6 +33,7 @@ from dit_models import (
     LandscapeDataset,
     transform,
     compute_fid_score,   # optional
+    VAEWrapper,          # for latent space training
 )
 
 from torch.utils.data import DataLoader
@@ -42,7 +43,7 @@ from torch.utils.data import DataLoader
 # -------------------------
 # Default baseline configuration
 DEFAULT_CONFIG = {
-    "patch_size": 4,
+    "patch_size": 2,
     "depth": 8,
     "num_heads": 6,
     "timesteps": 1000,
@@ -52,7 +53,7 @@ DEFAULT_CONFIG = {
 # Hyperparameter variations (one at a time from baseline)
 EXPERIMENT_CONFIG = {
     # Vary patch size (keep others at default)
-    "patch_size_experiments": [4, 8, 16, 32],
+    "patch_size_experiments": [2, 4, 8],
     
     # Vary depth (keep others at default)
     "depth_experiments": [4, 6, 8, 10],
@@ -65,14 +66,19 @@ EXPERIMENT_CONFIG = {
     
     # Fixed training parameters
     "hidden_size": 384,
-    "batch_size": 16,
-    "epochs_per_run": 5,
-    "lr": 1e-5,
+    "batch_size": 128,
+    "epochs_per_run": 10,
+    "lr": 5e-5,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "seed": 42,
     "compute_fid": True,  # Disabled for faster experiments
     "fid_num_samples": 32,
-    "fid_batch_size": 32
+    "fid_batch_size": 32,
+    
+    # VAE settings (set to True to use latent space training like official DiT)
+    "use_vae": True,  # Enable VAE encoding/decoding
+    "vae_model": "stabilityai/sd-vae-ft-ema",  # Pretrained VAE model
+    "image_size": 128,  # Original image size (will be 128//8=16 in latent space)
 }
 
 # -------------------------
@@ -114,14 +120,39 @@ def run_single_experiment(cfg, dataset_root, outdir, exp_id, config_dict):
     set_seed(cfg["seed"])
     torch.backends.cudnn.benchmark = True
 
+    # Initialize VAE if enabled
+    vae_wrapper = None
+    if cfg.get("use_vae", False):
+        print(f"[{exp_id}] Initializing VAE for latent space training...")
+        try:
+            vae_wrapper = VAEWrapper(vae_model_name=cfg["vae_model"], device=device)
+            latent_size = vae_wrapper.get_latent_size(cfg["image_size"])
+            latent_channels = vae_wrapper.get_latent_channels()
+            print(f"[{exp_id}] VAE initialized. Latent size: {latent_size}x{latent_size}, Channels: {latent_channels}")
+        except Exception as e:
+            print(f"[{exp_id}] Warning: Could not initialize VAE: {e}")
+            print(f"[{exp_id}] Falling back to pixel-space training")
+            vae_wrapper = None
+
+    # Determine model input parameters based on VAE usage
+    if vae_wrapper is not None:
+        model_img_size = latent_size
+        model_in_channels = latent_channels
+        use_latent_space = True
+    else:
+        model_img_size = cfg["image_size"]
+        model_in_channels = 3
+        use_latent_space = False
+
     # Create model with chosen config
     model = DiT(
-        img_size=128,
+        img_size=model_img_size,
         patch_size=config_dict["patch_size"],
-        in_channels=3,
+        in_channels=model_in_channels,
         hidden_size=cfg["hidden_size"],
         depth=config_dict["depth"],
         num_heads=config_dict["num_heads"],
+        use_latent_space=use_latent_space,
     ).to(device)
 
     # Scheduler
@@ -134,9 +165,11 @@ def run_single_experiment(cfg, dataset_root, outdir, exp_id, config_dict):
 
     # Train for specified epochs
     epochs = cfg["epochs_per_run"]
-    print(f"[{exp_id}] Starting training: patch={config_dict['patch_size']} depth={config_dict['depth']} heads={config_dict['num_heads']} timesteps={config_dict['timesteps']} epochs={epochs}")
+    mode_str = "latent-space" if vae_wrapper is not None else "pixel-space"
+    print(f"[{exp_id}] Starting training ({mode_str}): patch={config_dict['patch_size']} depth={config_dict['depth']} heads={config_dict['num_heads']} timesteps={config_dict['timesteps']} epochs={epochs}")
 
-    epoch_losses, all_losses = train_n_epochs(model, dataloader, optimizer, noise_scheduler, device=device, num_epochs=epochs)
+    epoch_losses, all_losses = train_n_epochs(model, dataloader, optimizer, noise_scheduler, 
+                                             device=device, num_epochs=epochs, vae_wrapper=vae_wrapper)
 
     # Save losses, plots, checkpoint
     outdir.mkdir(parents=True, exist_ok=True)
@@ -166,14 +199,29 @@ def run_single_experiment(cfg, dataset_root, outdir, exp_id, config_dict):
             print(f"[{exp_id}] Computing FID (this will be slow)...")
             # Prepare a small real dataloader for FID reference
             real_loader = build_dataloader(dataset_root, batch_size=cfg["fid_batch_size"], shuffle=False)
-            fid_score = compute_fid_score(
-                model=model,
-                noise_scheduler=noise_scheduler,
-                real_dataloader=real_loader,
-                num_samples=cfg["fid_num_samples"],
-                batch_size=cfg["fid_batch_size"],
-                device=device
-            )
+            
+            # Pass VAE parameters if using latent space
+            if vae_wrapper is not None:
+                fid_score = compute_fid_score(
+                    model=model,
+                    noise_scheduler=noise_scheduler,
+                    real_dataloader=real_loader,
+                    num_samples=cfg["fid_num_samples"],
+                    batch_size=cfg["fid_batch_size"],
+                    device=device,
+                    vae_wrapper=vae_wrapper,
+                    latent_size=latent_size,
+                    latent_channels=latent_channels
+                )
+            else:
+                fid_score = compute_fid_score(
+                    model=model,
+                    noise_scheduler=noise_scheduler,
+                    real_dataloader=real_loader,
+                    num_samples=cfg["fid_num_samples"],
+                    batch_size=cfg["fid_batch_size"],
+                    device=device
+                )
             print(f"[{exp_id}] FID = {fid_score:.4f}")
         except Exception as e:
             print(f"[{exp_id}] FID computation failed: {e}")
@@ -192,6 +240,8 @@ def run_single_experiment(cfg, dataset_root, outdir, exp_id, config_dict):
         "checkpoint": str(ckpt_path),
         "all_loss_png": str(all_loss_plot_path),
         "epoch_loss_png": str(epoch_loss_plot_path),
+        "use_vae": vae_wrapper is not None,
+        "latent_space": use_latent_space,
     }
 
     return summary
@@ -207,7 +257,8 @@ def sweep_and_run(global_cfg, dataset_root):
     out_root = make_output_dir()
     csv_path = out_root / "experiment_results.csv"
     fieldnames = ["exp_id", "varied_param", "patch_size", "depth", "num_heads", "timesteps", 
-                  "params", "avg_epoch_loss", "fid", "checkpoint", "all_loss_png", "epoch_loss_png"]
+                  "params", "avg_epoch_loss", "fid", "checkpoint", "all_loss_png", "epoch_loss_png",
+                  "use_vae", "latent_space"]
     
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

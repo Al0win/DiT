@@ -20,6 +20,15 @@ from torchvision.utils import make_grid
 from scipy import linalg
 from torchvision.models import inception_v3
 
+# VAE imports
+try:
+    from diffusers.models import AutoencoderKL
+    VAE_AVAILABLE = True
+except ImportError:
+    VAE_AVAILABLE = False
+    print("Warning: diffusers not installed. VAE functionality will not be available.")
+    print("Install with: pip install diffusers")
+
 
 # ============================================================================
 # Dataset
@@ -141,6 +150,56 @@ class NoiseScheduler:
 # Model Components
 # ============================================================================
 
+def get_2d_sincos_pos_embed(embed_dim, grid_size):
+    """
+    Create 2D sinusoidal positional embeddings.
+    
+    Args:
+        embed_dim: Embedding dimension
+        grid_size: Number of patches along each dimension (height and width)
+    
+    Returns:
+        pos_embed: [grid_size*grid_size, embed_dim] positional embedding
+    """
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # w goes first
+    grid = np.stack(grid, axis=0)
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    
+    # Split into height and width embeddings
+    assert embed_dim % 2 == 0
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+    pos_embed = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
+    return pos_embed
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    Create 1D sinusoidal positional embeddings.
+    
+    Args:
+        embed_dim: Output dimension for each position
+        pos: Grid of positions, shape (M,)
+    
+    Returns:
+        emb: (M, D) positional embeddings
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+    
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+    
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+
 class TimeEmbedding(nn.Module):
     """Sinusoidal time embedding layer."""
     def __init__(self, dim):
@@ -214,7 +273,18 @@ class DiTBlock(nn.Module):
 
 
 class DiT(nn.Module):
-    """Diffusion Transformer (DiT) model for image generation."""
+    """Diffusion Transformer (DiT) model for image generation.
+    
+    Args:
+        img_size: Size of input image (or latent representation)
+        patch_size: Size of patches to divide the image into
+        in_channels: Number of input channels (3 for RGB, 4 for latent space)
+        hidden_size: Dimension of the transformer hidden state
+        depth: Number of transformer blocks
+        num_heads: Number of attention heads
+        mlp_ratio: Ratio of mlp hidden dim to embedding dim
+        use_latent_space: If True, expects 4-channel latent inputs (img_size should be latent_size)
+    """
     def __init__(
         self,
         img_size=128,
@@ -224,6 +294,7 @@ class DiT(nn.Module):
         depth=6,
         num_heads=4,
         mlp_ratio=4.0,
+        use_latent_space=False,
     ):
         super().__init__()
         self.img_size = img_size
@@ -231,6 +302,7 @@ class DiT(nn.Module):
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.num_heads = num_heads
+        self.use_latent_space = use_latent_space
         
         self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, hidden_size)
         num_patches = self.patch_embed.num_patches
@@ -242,7 +314,8 @@ class DiT(nn.Module):
             nn.Linear(hidden_size, hidden_size)
         )
         
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size))
+        # Fixed sin-cos positional embedding (not learned, like official DiT)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
         
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio)
@@ -266,7 +339,13 @@ class DiT(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
         
-        nn.init.normal_(self.pos_embed, std=0.02)
+        # Initialize (and freeze) pos_embed with 2D sin-cos pattern
+        # This matches the official DiT implementation
+        pos_embed = get_2d_sincos_pos_embed(
+            self.pos_embed.shape[-1], 
+            int(self.patch_embed.num_patches ** 0.5)
+        )
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         
         w = self.patch_embed.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -315,8 +394,18 @@ class DiT(nn.Module):
 # Training Functions
 # ============================================================================
 
-def train_one_epoch(model, dataloader, optimizer, noise_scheduler, device, epoch=0):
-    """Train the DiT model for one epoch."""
+def train_one_epoch(model, dataloader, optimizer, noise_scheduler, device, epoch=0, vae_wrapper=None):
+    """Train the DiT model for one epoch.
+    
+    Args:
+        model: DiT model
+        dataloader: DataLoader for training data
+        optimizer: Optimizer
+        noise_scheduler: Noise scheduler for diffusion
+        device: Device to train on
+        epoch: Current epoch number
+        vae_wrapper: Optional VAEWrapper for latent space training
+    """
     model.train()
     total_loss = 0
     losses = []
@@ -325,6 +414,11 @@ def train_one_epoch(model, dataloader, optimizer, noise_scheduler, device, epoch
     for batch_idx, (images, _) in enumerate(progress_bar):
         images = images.to(device)
         batch_size = images.shape[0]
+        
+        # Encode to latent space if using VAE
+        if vae_wrapper is not None:
+            with torch.no_grad():
+                images = vae_wrapper.encode(images)
         
         t = torch.randint(0, noise_scheduler.num_timesteps, (batch_size,), device=device).long()
         
@@ -347,8 +441,18 @@ def train_one_epoch(model, dataloader, optimizer, noise_scheduler, device, epoch
     return avg_loss, losses
 
 
-def train_n_epochs(model, dataloader, optimizer, noise_scheduler, device, num_epochs=5):
-    """Train the DiT model for multiple epochs."""
+def train_n_epochs(model, dataloader, optimizer, noise_scheduler, device, num_epochs=5, vae_wrapper=None):
+    """Train the DiT model for multiple epochs.
+    
+    Args:
+        model: DiT model
+        dataloader: DataLoader for training data
+        optimizer: Optimizer
+        noise_scheduler: Noise scheduler for diffusion
+        device: Device to train on
+        num_epochs: Number of epochs to train
+        vae_wrapper: Optional VAEWrapper for latent space training
+    """
     epoch_losses = []
     all_losses = []
     
@@ -357,7 +461,8 @@ def train_n_epochs(model, dataloader, optimizer, noise_scheduler, device, num_ep
         print(f"Epoch {epoch + 1}/{num_epochs}")
         print(f"{'='*50}")
         
-        avg_loss, losses = train_one_epoch(model, dataloader, optimizer, noise_scheduler, device, epoch + 1)
+        avg_loss, losses = train_one_epoch(model, dataloader, optimizer, noise_scheduler, 
+                                          device, epoch + 1, vae_wrapper=vae_wrapper)
         
         epoch_losses.append(avg_loss)
         all_losses.extend(losses)
@@ -401,8 +506,19 @@ def visualize_epoch_loss(epoch_losses, save_path='epoch_loss_curve.png'):
 
 @torch.no_grad()
 def ddpm_sample(model, noise_scheduler, batch_size=1, img_size=128, 
-                channels=3, device='cuda', save_intermediates=False):
-    """DDPM sampling process (reverse diffusion)."""
+                channels=3, device='cuda', save_intermediates=False, vae_wrapper=None):
+    """DDPM sampling process (reverse diffusion).
+    
+    Args:
+        model: DiT model
+        noise_scheduler: Noise scheduler
+        batch_size: Number of samples to generate
+        img_size: Size of output images (or latent size if using VAE)
+        channels: Number of channels (3 for RGB, 4 for latents)
+        device: Device to use
+        save_intermediates: Whether to save intermediate denoising steps
+        vae_wrapper: Optional VAEWrapper for decoding latents to images
+    """
     model.eval()
     
     x = torch.randn(batch_size, channels, img_size, img_size, device=device)
@@ -418,7 +534,10 @@ def ddpm_sample(model, noise_scheduler, batch_size=1, img_size=128,
         alpha_t_cumprod_prev = noise_scheduler.alphas_cumprod_prev[t]
         
         pred_x0 = (x - torch.sqrt(1 - alpha_t_cumprod) * predicted_noise) / torch.sqrt(alpha_t_cumprod)
-        pred_x0 = torch.clamp(pred_x0, -1, 1)
+        
+        # Only clamp if not in latent space (latents don't need clamping)
+        if vae_wrapper is None:
+            pred_x0 = torch.clamp(pred_x0, -1, 1)
         
         posterior_mean = (
             noise_scheduler.posterior_mean_coef1[t] * pred_x0 +
@@ -435,6 +554,12 @@ def ddpm_sample(model, noise_scheduler, batch_size=1, img_size=128,
         if save_intermediates and t % (noise_scheduler.num_timesteps // 10) == 0:
             intermediates.append(pred_x0.cpu())
     
+    # Decode from latent space if using VAE
+    if vae_wrapper is not None:
+        x = vae_wrapper.decode(x)
+        if intermediates is not None:
+            intermediates = [vae_wrapper.decode(inter.to(device)).cpu() for inter in intermediates]
+    
     if save_intermediates:
         return x, intermediates
     return x
@@ -443,8 +568,21 @@ def ddpm_sample(model, noise_scheduler, batch_size=1, img_size=128,
 @torch.no_grad()
 def ddim_sample(model, noise_scheduler, batch_size=1, img_size=128, 
                 channels=3, device='cuda', num_inference_steps=50, 
-                eta=0.0, save_intermediates=False):
-    """DDIM sampling process (deterministic, faster sampling)."""
+                eta=0.0, save_intermediates=False, vae_wrapper=None):
+    """DDIM sampling process (deterministic, faster sampling).
+    
+    Args:
+        model: DiT model
+        noise_scheduler: Noise scheduler
+        batch_size: Number of samples to generate
+        img_size: Size of output images (or latent size if using VAE)
+        channels: Number of channels (3 for RGB, 4 for latents)
+        device: Device to use
+        num_inference_steps: Number of sampling steps (fewer = faster)
+        eta: DDIM stochasticity parameter (0 = deterministic)
+        save_intermediates: Whether to save intermediate denoising steps
+        vae_wrapper: Optional VAEWrapper for decoding latents to images
+    """
     model.eval()
     
     step_size = noise_scheduler.num_timesteps // num_inference_steps
@@ -468,7 +606,10 @@ def ddim_sample(model, noise_scheduler, batch_size=1, img_size=128,
             alpha_t_cumprod_prev = torch.tensor(1.0, device=device)
         
         pred_x0 = (x - torch.sqrt(1 - alpha_t_cumprod) * predicted_noise) / torch.sqrt(alpha_t_cumprod)
-        pred_x0 = torch.clamp(pred_x0, -1, 1)
+        
+        # Only clamp if not in latent space
+        if vae_wrapper is None:
+            pred_x0 = torch.clamp(pred_x0, -1, 1)
         
         sigma_t = eta * torch.sqrt((1 - alpha_t_cumprod_prev) / (1 - alpha_t_cumprod)) * \
                   torch.sqrt(1 - alpha_t_cumprod / alpha_t_cumprod_prev)
@@ -484,9 +625,73 @@ def ddim_sample(model, noise_scheduler, batch_size=1, img_size=128,
         if save_intermediates:
             intermediates.append(pred_x0.cpu())
     
+    # Decode from latent space if using VAE
+    if vae_wrapper is not None:
+        x = vae_wrapper.decode(x)
+        if intermediates is not None:
+            intermediates = [vae_wrapper.decode(inter.to(device)).cpu() for inter in intermediates]
+    
     if save_intermediates:
         return x, intermediates
     return x
+
+
+# ============================================================================
+# VAE Wrapper
+# ============================================================================
+
+class VAEWrapper:
+    """
+    Wrapper for Stable Diffusion VAE (AutoencoderKL).
+    Handles encoding images to latent space and decoding back.
+    """
+    def __init__(self, vae_model_name="stabilityai/sd-vae-ft-ema", device='cuda'):
+        if not VAE_AVAILABLE:
+            raise ImportError("diffusers package is required for VAE functionality. Install with: pip install diffusers")
+        
+        self.device = device
+        self.vae = AutoencoderKL.from_pretrained(vae_model_name).to(device)
+        self.vae.eval()
+        # Scaling factor used in Stable Diffusion
+        self.scale_factor = 0.18215
+        
+        # Freeze VAE parameters
+        for param in self.vae.parameters():
+            param.requires_grad = False
+    
+    @torch.no_grad()
+    def encode(self, images):
+        """
+        Encode images to latent space.
+        Args:
+            images: (B, 3, H, W) tensor of images in range [-1, 1]
+        Returns:
+            latents: (B, 4, H//8, W//8) tensor of latents
+        """
+        latents = self.vae.encode(images).latent_dist.sample()
+        latents = latents * self.scale_factor
+        return latents
+    
+    @torch.no_grad()
+    def decode(self, latents):
+        """
+        Decode latents to images.
+        Args:
+            latents: (B, 4, H//8, W//8) tensor of latents
+        Returns:
+            images: (B, 3, H, W) tensor of images in range [-1, 1]
+        """
+        latents = latents / self.scale_factor
+        images = self.vae.decode(latents).sample
+        return images
+    
+    def get_latent_size(self, image_size):
+        """Get the latent size for a given image size (always image_size // 8)"""
+        return image_size // 8
+    
+    def get_latent_channels(self):
+        """Get the number of latent channels (always 4 for SD VAE)"""
+        return 4
 
 
 # ============================================================================
@@ -535,8 +740,21 @@ def calculate_fid(real_features, generated_features):
 
 @torch.no_grad()
 def compute_fid_score(model, noise_scheduler, real_dataloader, 
-                      num_samples=1000, batch_size=32, device='cuda'):
-    """Compute FID score for generated samples vs real images."""
+                      num_samples=1000, batch_size=32, device='cuda',
+                      vae_wrapper=None, latent_size=None, latent_channels=4):
+    """Compute FID score for generated samples vs real images.
+    
+    Args:
+        model: DiT model
+        noise_scheduler: Noise scheduler
+        real_dataloader: DataLoader for real images
+        num_samples: Number of samples to generate
+        batch_size: Batch size for generation
+        device: Device to use
+        vae_wrapper: Optional VAEWrapper for latent space models
+        latent_size: Size of latent space (if using VAE)
+        latent_channels: Number of latent channels (if using VAE)
+    """
     feature_extractor = InceptionFeatureExtractor(device)
     
     print("Extracting features from real images...")
@@ -554,11 +772,25 @@ def compute_fid_score(model, noise_scheduler, real_dataloader,
     num_batches = (num_samples + batch_size - 1) // batch_size
     
     for _ in tqdm(range(num_batches)):
-        samples = ddpm_sample(
-            model, noise_scheduler, 
-            batch_size=min(batch_size, num_samples - len(generated_features) * batch_size),
-            device=device
-        )
+        current_batch_size = min(batch_size, num_samples - len(generated_features) * batch_size)
+        
+        # Determine correct parameters based on VAE usage
+        if vae_wrapper is not None:
+            samples = ddpm_sample(
+                model, noise_scheduler, 
+                batch_size=current_batch_size,
+                img_size=latent_size,
+                channels=latent_channels,
+                device=device,
+                vae_wrapper=vae_wrapper
+            )
+        else:
+            samples = ddpm_sample(
+                model, noise_scheduler, 
+                batch_size=current_batch_size,
+                device=device
+            )
+        
         features = feature_extractor.get_features(samples)
         generated_features.append(features)
     

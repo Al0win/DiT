@@ -1,0 +1,5 @@
+Varied Parameter,Best Value,Best Loss,Num Params
+patch_size,2,0.1875,"21,908,368"
+depth,10,0.1866,"27,228,304"
+num_heads,1,0.1848,"21,908,368"
+timesteps,1000,0.1875,"21,908,368"
