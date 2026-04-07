@@ -1,6 +1,8 @@
 # DiT (Diffusion Transformer) Project — Quick Guide
 
 NOTE: report.pdf contains the comprehensive report.
+
+
 This repository contains scripts for training, analyzing, and visualizing Diffusion Transformer (DiT) models for image generation.
 
 ## Script Overview
