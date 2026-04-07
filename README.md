@@ -1,5 +1,6 @@
 # DiT (Diffusion Transformer) Project — Quick Guide
 
+NOTE:report.pdf contains the comprehensive report.
 This repository contains scripts for training, analyzing, and visualizing Diffusion Transformer (DiT) models for image generation.
 
 ## Script Overview
@@ -21,5 +22,4 @@ This repository contains scripts for training, analyzing, and visualizing Diffus
 - **dit_pretrained_and_cfg_using_sd.py**: Variant using Stable Diffusion as the backend for pretrained DiT-based visualization and CFG analysis.
   - Run: `python dit_pretrained_and_cfg_using_sd.py`
 
-## Notes
-- For experiment outputs, see the `experiments/`, `visualizations/`, `pixelart_results` and `sd1.4_results` folders.
+
